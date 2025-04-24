@@ -1,153 +1,116 @@
-# coding: utf-8
-
 import os
 import re
 import numpy as np
 import pandas as pd
 import ujson as json
+from tqdm import tqdm
+import xarray as xr
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 
-patient_ids = []
+data_path = "../clasp-src/data/IMPROVE_2010.nc"
+print(f"Loading data from: {os.path.abspath(data_path)}")
+try:
+    ds = xr.open_dataset(data_path)
+except FileNotFoundError:
+    print(f"Error: File not found at {os.path.abspath(data_path)}. Please ensure the file exists.")
+    exit
 
-for filename in os.listdir('./raw'):
-    # the patient data in PhysioNet contains 6-digits
-    match = re.search('\d{6}', filename)
-    if match:
-        id_ = match.group()
-        patient_ids.append(id_)
+df = ds.to_dataframe().reset_index()
+print(df.head())
+fully_nan_cols = df.columns[df.isna().all()]
+print("Fully NaN columns:", fully_nan_cols.tolist())
 
-out = pd.read_csv('./raw/Outcomes-a.txt').set_index('RecordID')['In-hospital_death']
+unique_sites = df['site'].unique()
 
-# we select 35 attributes which contains enough non-values
-attributes = ['DiasABP', 'HR', 'Na', 'Lactate', 'NIDiasABP', 'PaO2', 'WBC', 'pH', 'Albumin', 'ALT', 'Glucose', 'SaO2',
-              'Temp', 'AST', 'Bilirubin', 'HCO3', 'BUN', 'RespRate', 'Mg', 'HCT', 'SysABP', 'FiO2', 'K', 'GCS',
-              'Cholesterol', 'NISysABP', 'TroponinT', 'MAP', 'TroponinI', 'PaCO2', 'Platelets', 'Urine', 'NIMAP',
-              'Creatinine', 'ALP']
+print(len(unique_sites))
 
-# mean and std of 35 attributes
-mean = np.array([59.540976152469405, 86.72320413227443, 139.06972964987443, 2.8797765291788986, 58.13833409690321,
-                 147.4835678885565, 12.670222585415166, 7.490957887101613, 2.922874149659863, 394.8899400819931,
-                 141.4867570064675, 96.66380228136883, 37.07362841054398, 505.5576196473552, 2.906465787821709,
-                 23.118951553526724, 27.413004968675743, 19.64795551193981, 2.0277491155660416, 30.692432164676188,
-                 119.60137167841977, 0.5404785381886381, 4.135790642787733, 11.407767149315339, 156.51746031746032,
-                 119.15012244292181, 1.2004983498349853, 80.20321011673151, 7.127188940092161, 40.39875518672199,
-                 191.05877024038804, 116.1171573535279, 77.08923183026529, 1.5052390166989214, 116.77122488658458])
+data_numeric = df.select_dtypes(include=[np.number])
+print(data_numeric.head())
 
-std = np.array(
-    [13.01436781437145, 17.789923096504985, 5.185595006246348, 2.5287518090506755, 15.06074282896952, 85.96290370390257,
-     7.649058756791069, 8.384743923130074, 0.6515057685658769, 1201.033856726966, 67.62249645388543, 3.294112002091972,
-     1.5604879744921516, 1515.362517984297, 5.902070316876287, 4.707600932877377, 23.403743427107095, 5.50914416318306,
-     0.4220051299992514, 5.002058959758486, 23.730556355204214, 0.18634432509312762, 0.706337033602292,
-     3.967579823394297, 45.99491531484596, 21.97610723063014, 2.716532297586456, 16.232515568438338, 9.754483687298688,
-     9.062327978713556, 106.50939503021543, 170.65318497610315, 14.856134327604906, 1.6369529387005546,
-     133.96778334724377])
+min_max_scaler = MinMaxScaler()
+data_normalized_min_max = min_max_scaler.fit_transform(data_numeric)
 
-fs = open('./json/json', 'w')
+# print(data_normalized_min_max.head())
 
-def to_time_bin(x):
-    h, m = map(int, x.split(':'))
-    return h
+og_data = data_normalized_min_max
+print("data loaded successfully")
+print("reshaping data...")
 
+num_sites = len(unique_sites)
+sites = []
+site_set = set()
+for i in range(num_sites):
+    sites.append([])
+idx = 0
+for i, row in enumerate(og_data):
+    # print(i, i%num_sites, len(sites), len(data))
+    sites[i%num_sites].append(row)
+    site_set.add((row[-4], row[-3]))
 
-def parse_data(x):
-    x = x.set_index('Parameter').to_dict()['Value']
+data = np.array(sites)
 
-    values = []
+print(data.shape)
+def make_masks_and_eval(data, missing_ratio=0.1):
+    """
+    Create masks and evaluation masks for BRITS training.
+    """
+    masks = ~np.isnan(data)             # (sites, days, features)
+    evals = np.copy(data)
+    eval_masks = np.zeros_like(masks, dtype=bool)
 
-    for attr in attributes:
-        if x.has_key(attr):
-            values.append(x[attr])
-        else:
-            values.append(np.nan)
-    return values
+    for i in tqdm(range(data.shape[0]), desc="making masks", unit="site"):
+        known_indices = np.argwhere(masks[i])
+        n_eval = int(len(known_indices) * missing_ratio)
+        sampled = known_indices[np.random.choice(len(known_indices), n_eval, replace=False)]
+        for d, f in sampled:
+            data[i, d, f] = np.nan
+            eval_masks[i, d, f] = True
 
+    return data, masks.astype(int), evals, eval_masks.astype(int)
 
-def parse_delta(masks, dir_):
-    if dir_ == 'backward':
-        masks = masks[::-1]
+def compute_deltas(masks):
+    """
+    Compute time gaps between observations for each feature.
+    """
+    sites, days, features = masks.shape
+    deltas = np.zeros_like(masks, dtype=np.float32)
 
-    deltas = []
+    for s in tqdm(range(data.shape[0]), desc="computing deltas", unit="site"):
+        for f in range(features):
+            last_observed = 0
+            for t in range(days):
+                if masks[s, t, f]:
+                    deltas[s, t, f] = 0
+                    last_observed = 0
+                else:
+                    last_observed += 1
+                    deltas[s, t, f] = last_observed
+    return deltas
 
-    for h in range(48):
-        if h == 0:
-            deltas.append(np.ones(35))
-        else:
-            deltas.append(np.ones(35) + (1 - masks[h]) * deltas[-1])
+def prepare_brits_records(data):
+    """
+    Package everything into a list of dicts for BRITS.
+    One dict per site.
+    """
+    data, masks, evals, eval_masks = make_masks_and_eval(np.copy(data))
+    deltas = compute_deltas(masks)
 
-    return np.array(deltas)
+    records = []
+    print("Preparing BRITS records...", flush=True)
+    for s in tqdm(range(data.shape[0]), desc="Processing sites", unit="site"):
+        record = {
+            "values": np.nan_to_num(data[s]).tolist(),
+            "masks": masks[s].tolist(),
+            "evals": np.nan_to_num(evals[s]).tolist(),
+            "eval_masks": eval_masks[s].tolist(),
+            "deltas": deltas[s].tolist(),
+            "forwards": pd.DataFrame(data[s]).fillna(method="ffill").fillna(0.0).to_numpy().tolist()
+        }
+        records.append(record)
+    return records
 
+records = prepare_brits_records(data)
 
-def parse_rec(values, masks, evals, eval_masks, dir_):
-    deltas = parse_delta(masks, dir_)
-
-    # only used in GRU-D
-    forwards = pd.DataFrame(values).fillna(method='ffill').fillna(0.0).as_matrix()
-
-    rec = {}
-
-    rec['values'] = np.nan_to_num(values).tolist()
-    rec['masks'] = masks.astype('int32').tolist()
-    # imputation ground-truth
-    rec['evals'] = np.nan_to_num(evals).tolist()
-    rec['eval_masks'] = eval_masks.astype('int32').tolist()
-    rec['forwards'] = forwards.tolist()
-    rec['deltas'] = deltas.tolist()
-
-    return rec
-
-
-def parse_id(id_):
-    data = pd.read_csv('./raw/{}.txt'.format(id_))
-    # accumulate the records within one hour
-    data['Time'] = data['Time'].apply(lambda x: to_time_bin(x))
-
-    evals = []
-
-    # merge all the metrics within one hour
-    for h in range(48):
-        evals.append(parse_data(data[data['Time'] == h]))
-
-    evals = (np.array(evals) - mean) / std
-
-    shp = evals.shape
-
-    evals = evals.reshape(-1)
-
-    # randomly eliminate 10% values as the imputation ground-truth
-    indices = np.where(~np.isnan(evals))[0].tolist()
-    indices = np.random.choice(indices, len(indices) // 10)
-
-    values = evals.copy()
-    values[indices] = np.nan
-
-    masks = ~np.isnan(values)
-    eval_masks = (~np.isnan(values)) ^ (~np.isnan(evals))
-
-    evals = evals.reshape(shp)
-    values = values.reshape(shp)
-
-    masks = masks.reshape(shp)
-    eval_masks = eval_masks.reshape(shp)
-
-    label = out.loc[int(id_)]
-
-    rec = {'label': label}
-
-    # prepare the model for both directions
-    rec['forward'] = parse_rec(values, masks, evals, eval_masks, dir_='forward')
-    rec['backward'] = parse_rec(values[::-1], masks[::-1], evals[::-1], eval_masks[::-1], dir_='backward')
-
-    rec = json.dumps(rec)
-
-    fs.write(rec + '\n')
-
-
-for id_ in patient_ids:
-    print('Processing patient {}'.format(id_))
-    try:
-        parse_id(id_)
-    except Exception as e:
-        print(e)
-        continue
-
-fs.close()
-
+with open("./json/improve_brits_data.json", "w") as f:
+    for rec in tqdm(records, desc="Processing records", unit="record"):
+        f.write(json.dumps({"forward": rec, "backward": rec}) + "\n")

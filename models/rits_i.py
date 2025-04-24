@@ -1,137 +1,95 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-
 from torch.autograd import Variable
 from torch.nn.parameter import Parameter
-
 import math
-import utils
-import argparse
-import data_loader
 
-from ipdb import set_trace
-from sklearn import metrics
-
-SEQ_LEN = 48
-
-def binary_cross_entropy_with_logits(input, target, weight=None, size_average=True, reduce=True):
-    if not (target.size() == input.size()):
-        raise ValueError("Target size ({}) must be the same as input size ({})".format(target.size(), input.size()))
-
-    max_val = (-input).clamp(min=0)
-    loss = input - input * target + max_val + ((-max_val).exp() + (-input - max_val).exp()).log()
-
-    if weight is not None:
-        loss = loss * weight
-
-    if not reduce:
-        return loss
-    elif size_average:
-        return loss.mean()
-    else:
-        return loss.sum()
-
+SEQ_LEN = 10  # you can modify this depending on your data window size
 
 class TemporalDecay(nn.Module):
     def __init__(self, input_size, rnn_hid_size):
         super(TemporalDecay, self).__init__()
         self.rnn_hid_size = rnn_hid_size
-        self.build(input_size)
-
-    def build(self, input_size):
-        self.W = Parameter(torch.Tensor(self.rnn_hid_size, input_size))
-        self.b = Parameter(torch.Tensor(self.rnn_hid_size))
+        self.W = Parameter(torch.Tensor(rnn_hid_size, input_size))
+        self.b = Parameter(torch.Tensor(rnn_hid_size))
         self.reset_parameters()
 
     def reset_parameters(self):
         stdv = 1. / math.sqrt(self.W.size(0))
         self.W.data.uniform_(-stdv, stdv)
-        if self.b is not None:
-            self.b.data.uniform_(-stdv, stdv)
+        self.b.data.uniform_(-stdv, stdv)
 
     def forward(self, d):
         gamma = F.relu(F.linear(d, self.W, self.b))
-        gamma = torch.exp(-gamma)
-        return gamma
+        return torch.exp(-gamma)
 
 class Model(nn.Module):
-    def __init__(self, rnn_hid_size, impute_weight, label_weight):
+    def __init__(self, input_size, rnn_hid_size, impute_weight):
         super(Model, self).__init__()
-
+        self.input_size = input_size
         self.rnn_hid_size = rnn_hid_size
         self.impute_weight = impute_weight
-        self.label_weight = label_weight
 
-        self.build()
+        self.rnn_cell = nn.LSTMCell(input_size * 2, rnn_hid_size)
+        self.regression = nn.Linear(rnn_hid_size, input_size)
+        self.temp_decay = TemporalDecay(input_size=input_size, rnn_hid_size=rnn_hid_size)
 
-    def build(self):
-        self.rnn_cell = nn.LSTMCell(35 * 2, self.rnn_hid_size)
-
-        self.regression = nn.Linear(self.rnn_hid_size, 35)
-        self.temp_decay = TemporalDecay(input_size = 35, rnn_hid_size = self.rnn_hid_size)
-
-        self.out = nn.Linear(self.rnn_hid_size, 1)
-
-    def forward(self, data, direct):
-        # Original sequence with 24 time steps
-        values = data[direct]['values']
-        masks = data[direct]['masks']
-        deltas = data[direct]['deltas']
-
-        evals = data[direct]['evals']
-        eval_masks = data[direct]['eval_masks']
-
-        labels = data['labels'].view(-1, 1)
-        is_train = data['is_train'].view(-1, 1)
-
-        h = Variable(torch.zeros((values.size()[0], self.rnn_hid_size)))
-        c = Variable(torch.zeros((values.size()[0], self.rnn_hid_size)))
-
-        if torch.cuda.is_available():
-            h, c = h.cuda(), c.cuda()
-
-        x_loss = 0.0
-        y_loss = 0.0
+    def forward(self, data, direct='forward'):
+        values = data[direct]['values']      # [B, T, D]
+        masks = data[direct]['masks']        # [B, T, D]
+        deltas = data[direct]['deltas']      # [B, T, D]
+        evals = data[direct]['evals']        # [B, T, D]
+        eval_masks = data[direct]['eval_masks']  # [B, T, D]
+        
+        B, T, D = values.size()
+        h = torch.zeros(B, self.rnn_hid_size, device=values.device)
+        c = torch.zeros(B, self.rnn_hid_size, device=values.device)
 
         imputations = []
+        x_loss = 0.0
 
-        for t in range(SEQ_LEN):
-            x = values[:, t, :]
-            m = masks[:, t, :]
-            d = deltas[:, t, :]
+        # Process data in chunks of SEQ_LEN
+        for start in range(0, T, SEQ_LEN):
+            end = min(start + SEQ_LEN, T)
+            seq_values = values[:, start:end, :]  # [B, SEQ_LEN, D]
+            seq_masks = masks[:, start:end, :]      # [B, SEQ_LEN, D]
+            seq_deltas = deltas[:, start:end, :]    # [B, SEQ_LEN, D]
+            seq_evals = evals[:, start:end, :]      # [B, SEQ_LEN, D]
+            seq_eval_masks = eval_masks[:, start:end, :]  # [B, SEQ_LEN, D]
 
-            gamma = self.temp_decay(d)
-            h = h * gamma
-            x_h = self.regression(h)
+            for t in range(seq_values.size(1)):
+                x = seq_values[:, t, :]
+                m = seq_masks[:, t, :]
+                d = seq_deltas[:, t, :]
 
-            x_c =  m * x +  (1 - m) * x_h
+                gamma = self.temp_decay(d)
+                h = h * gamma
 
-            x_loss += torch.sum(torch.abs(x - x_h) * m) / (torch.sum(m) + 1e-5)
+                x_h = self.regression(h)
+                x_c = m * x + (1 - m) * x_h  # composite input
 
-            inputs = torch.cat([x_c, m], dim = 1)
+                # Compute imputation loss vs. ground truth evals
+                target = seq_evals[:, t, :]
+                target_mask = seq_eval_masks[:, t, :]
+                x_loss += torch.sum(torch.abs(x_h - target) * target_mask) / (torch.sum(target_mask) + 1e-5)
 
-            h, c = self.rnn_cell(inputs, (h, c))
+                inputs = torch.cat([x_c, m], dim=1)
+                h, c = self.rnn_cell(inputs, (h, c))
 
-            imputations.append(x_c.unsqueeze(dim = 1))
+                imputations.append(x_h.unsqueeze(1))
 
-        imputations = torch.cat(imputations, dim = 1)
+        imputations = torch.cat(imputations, dim=1)  # [B, T, D]
 
-        y_h = self.out(h)
-        y_loss = binary_cross_entropy_with_logits(y_h, labels, reduce = False)
+        return {
+            'loss': x_loss * self.impute_weight,
+            'imputations': imputations,
+            'evals': evals,
+            'eval_masks': eval_masks
+        }
 
-        # only use training labels
-        y_loss = torch.sum(y_loss * is_train) / (torch.sum(is_train) + 1e-5)
-
-        y_h = F.sigmoid(y_h)
-
-        return {'loss': x_loss * self.impute_weight + y_loss * self.label_weight, 'predictions': y_h,\
-                'imputations': imputations, 'labels': labels, 'is_train': is_train,\
-                'evals': evals, 'eval_masks': eval_masks}
-
-    def run_on_batch(self, data, optimizer, epoch = None):
-        ret = self(data, direct = 'forward')
+    def run_on_batch(self, data, optimizer=None, epoch=None):
+        ret = self(data, direct='forward')
 
         if optimizer is not None:
             optimizer.zero_grad()
