@@ -5,7 +5,7 @@ from torch.autograd import Variable
 from torch.nn.parameter import Parameter
 import math
 
-SEQ_LEN = 10  # you can modify this depending on your data window size
+SEQ_LEN = 50  # you can modify this depending on your data window size
 
 class TemporalDecay(nn.Module):
     def __init__(self, input_size, rnn_hid_size):

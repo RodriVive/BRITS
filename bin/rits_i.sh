@@ -20,4 +20,4 @@ cd BRITS
 nvidia-smi
 
 
-python main.py --model brits_i --epochs 30 --batch_size 64 --impute_weight 1 --hid_size 256
+python main.py --model brits_i --epochs 30 --batch_size 128 --impute_weight 1 --hid_size 256

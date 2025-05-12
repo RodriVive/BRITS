@@ -16,8 +16,8 @@ class Model(nn.Module):
         self.build()
 
     def build(self):
-        self.rits_f = rits_i.Model(133, self.rnn_hid_size, self.impute_weight)
-        self.rits_b = rits_i.Model(133, self.rnn_hid_size, self.impute_weight)
+        self.rits_f = rits_i.Model(30, self.rnn_hid_size, self.impute_weight)
+        self.rits_b = rits_i.Model(30, self.rnn_hid_size, self.impute_weight)
 
     def forward(self, data):
         # Run forward and backward imputations

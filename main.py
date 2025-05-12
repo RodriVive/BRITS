@@ -14,9 +14,12 @@ import argparse
 import data_loader
 import pandas as pd
 import ujson as json
+import os
+import xarray as xr
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+import matplotlib.pyplot as plt
 
 from sklearn import metrics
-
 from ipdb import set_trace
 
 parser = argparse.ArgumentParser()
@@ -25,33 +28,47 @@ parser.add_argument('--batch_size', type=int, default=32)
 parser.add_argument('--model', type=str)
 parser.add_argument('--hid_size', type=int)
 parser.add_argument('--impute_weight', type=float)
-# parser.add_argument('--label_weight', type=float)
 args = parser.parse_args()
 
-def save_full_imputations(model):
-    print("\nRunning final model on full dataset...")
 
-    all_iter = data_loader.get_loader(batch_size=1818, split='final', shuffle=False)
-
+def evaluate(model, val_iter):
     model.eval()
+
+    evals = []
     imputations = []
 
-    with torch.no_grad():
-        for data in all_iter:
-            data = utils.to_var(data)
-            ret = model.run_on_batch(data, None)
-            imputations.append(ret['imputations'].data.cpu().numpy())
+    for idx, data in enumerate(val_iter):
+        data = utils.to_var(data)
+        ret = model.run_on_batch(data, None)
 
-    imputations = np.concatenate(imputations, axis=0)
-    print("Full imputations shape:", imputations.shape)
-    np.save('./result/full_imputations_{}.npy'.format(args.model), imputations)
+        eval_masks = ret['eval_masks'].data.cpu().numpy()
+        eval_ = ret['evals'].data.cpu().numpy()
+        imputation = ret['imputations'].data.cpu().numpy()
+
+        evals += eval_[np.where(eval_masks == 1)].tolist()
+        imputations += imputation[np.where(eval_masks == 1)].tolist()
+
+    evals = np.asarray(evals)
+    imputations = np.asarray(imputations)
+
+    mae = np.abs(evals - imputations).mean()
+    mre = np.abs(evals - imputations).sum() / np.abs(evals).sum()
+
+    print('MAE', mae)
+    print('MRE', mre)
+
+    return mae
+
 
 def train(model):
     optimizer = optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    scheduler = StepLR(optimizer, step_size=10, gamma=0.1)
 
     train_iter = data_loader.get_loader(batch_size=args.batch_size, split='train')
     val_iter = data_loader.get_loader(batch_size=args.batch_size, split='val', shuffle=False)
+
+    train_maes = []
+    val_maes = []
 
     for epoch in range(args.epochs):
         model.train()
@@ -63,85 +80,97 @@ def train(model):
             ret = model.run_on_batch(data, optimizer, epoch)
             run_loss += ret['loss'].item()
 
-            # print('\rEpoch {}, {:.2f}% | Train Loss: {:.4f}'.format(
-            #     epoch, (idx + 1) * 100.0 / len(train_iter), run_loss / (idx + 1.0)
-            # ), end='')
-
         print("\nEvaluating on training set...")
-        evaluate(model, train_iter)
+        train_mae = evaluate(model, train_iter)
         print("\nEvaluating on validation set...")
-        evaluate(model, val_iter)
+        val_mae = evaluate(model, val_iter)
+
+        train_maes.append(train_mae)
+        val_maes.append(val_mae)
+
         scheduler.step()
 
+    # Plot and save training/validation MAE
+    plt.plot(train_maes, label="Train MAE")
+    plt.plot(val_maes, label="Validation MAE")
+    plt.xlabel("Epoch")
+    plt.ylabel("MAE")
+    plt.legend()
+    plt.title("Training and Validation MAE over Epochs")
+    plt.grid(True)
+    os.makedirs('./result', exist_ok=True)
+    plt.savefig(f'./result/mae_plot_{args.model}.png')
+    plt.close()
 
 
-def evaluate(model, val_iter):
+def save_full_imputations(model):
+    print("\nRunning final model on full dataset...")
+
+    all_iter = data_loader.get_loader(batch_size=183, split='final', shuffle=False)
+
     model.eval()
+    imputations = None
 
-    # labels = []
-    preds = []
+    with torch.no_grad():
+        for data in all_iter:
+            data = utils.to_var(data)
+            ret = model.run_on_batch(data, None)
+            imputations = ret['imputations'].data.cpu().numpy()
 
-    evals = []
-    imputations = []
+    # imputations = np.concatenate(imputations, axis=0)
+    imputations = np.vstack(imputations)
+    print(imputations[0])
+    print("Full imputations shape:", imputations.shape)
+    data_path = "../clasp-src/data/IMPROVE_2010.nc"
+    print(f"Loading data from: {os.path.abspath(data_path)}")
+    try:
+        ds = xr.open_dataset(data_path)
+    except FileNotFoundError:
+        print(f"Error: File not found at {os.path.abspath(data_path)}. Please ensure the file exists.")
+        exit()
+    df = ds.to_dataframe().reset_index()
+    df['site'] = df['site'].str.decode('utf-8')
+    sites_to_remove = ['MKGO1', 'ADPI1', 'LIVO1', 'CADI1', 'SIKE1', 'AREN1', 'DEVA1', 'CHER1', 'SOGP1']
+    df = df[~df['site'].isin(sites_to_remove)]
 
-    save_impute = []
-    # save_label = []
+    features = [
+        "SO4", "Ca", "Ti", "Fe", "Si", "SS", "POM", "EC1", "EC2", "EC3", "EC",
+        "EC1_mdl", "EC2_mdl", "EC3_mdl",
+        "EC1_unc", "EC2_unc", "EC3_unc",
+        "SO4_mdl", "Ca_mdl", "Ti_mdl", "Fe_mdl", "Si_mdl",
+        "SO4_unc", "Ca_unc", "Ti_unc", "Fe_unc", "Si_unc",
+        "lat", "lon", "elev", "timestamp", "site"
+    ]
+    df = df[features]
 
-    for idx, data in enumerate(val_iter):
-        data = utils.to_var(data)
-        ret = model.run_on_batch(data, None)
-        # print(ret.keys())
+    print(df.head())
+    fully_nan_cols = df.columns[df.isna().all()]
+    print("Fully NaN columns:", fully_nan_cols.tolist())
 
-        # save the imputation results which is used to test the improvement of traditional methods with imputed values
-        save_impute.append(ret['imputations'].data.cpu().numpy())
-        # save_label.append(ret['labels'].data.cpu().numpy())
+    unique_sites = df['site'].unique()
+    print("Number of unique sites:", len(unique_sites))
 
-        # pred = ret['predictions'].data.cpu().numpy()
-        # label = ret['labels'].data.cpu().numpy()
-        # is_train = ret['is_train'].data.cpu().numpy()
+    data_numeric = df.select_dtypes(include=[np.number])
+    print(imputations.shape)
+    df_imputed = pd.DataFrame(imputations, columns=data_numeric.columns)
+    print("df len:", len(df))
+    print("df_imputed len:", len(df_imputed))
 
+    print(df_imputed.head())
 
+    df_result = pd.concat([df.select_dtypes(exclude=[np.number]), df_imputed], axis=1)
+    print(df_result.head())
 
-        eval_masks = ret['eval_masks'].data.cpu().numpy()
-        eval_ = ret['evals'].data.cpu().numpy()
-        imputation = ret['imputations'].data.cpu().numpy()
+    ds_imputed = df_result.set_index(['time']).to_xarray()
 
-        evals += eval_[np.where(eval_masks == 1)].tolist()
-        imputations += imputation[np.where(eval_masks == 1)].tolist()
-
-        # collect test label & prediction
-        # pred = pred[np.where(is_train == 0)]
-        # label = label[np.where(is_train == 0)]
-
-        # labels += label.tolist()
-        # preds += pred.tolist()
-
-    # labels = np.asarray(labels).astype('int32')
-    # preds = np.asarray(preds)
-
-    # print('AUC {}'.format(metrics.roc_auc_score(labels, preds)))
-
-
-    evals = np.asarray(evals)
-    imputations = np.asarray(imputations)
-
-    print('MAE', np.abs(evals - imputations).mean())
-
-    print('MRE', np.abs(evals - imputations).sum() / np.abs(evals).sum())
-
-    # save_impute = np.concatenate(save_impute, axis=0)
-    # save_label = np.concatenate(save_label, axis=0)
-    # print("Sample evals:", evals[:5])
-    # print("Sample imputations:", imputations[:5])
-    # print("Unique imputations:", np.unique(imputations))
-    # print("Unique evals:", np.unique(evals))
-
-    # np.save('./result/{}_data'.format(args.model), save_impute)
-    # np.save('./result/{}_label'.format(args.model), save_label)
+    os.makedirs('./result', exist_ok=True)
+    output_path = f'./result/imputed_IMPROVE_2010_{args.model}.nc'
+    ds_imputed.to_netcdf(output_path)
+    print(f"Imputed data saved to: {os.path.abspath(output_path)}")
 
 
 def run():
-    model = getattr(models, args.model).Model(args.hid_size, args.impute_weight) #args.label_weight)
+    model = getattr(models, args.model).Model(args.hid_size, args.impute_weight)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('Total params is {}'.format(total_params))
 
@@ -151,6 +180,6 @@ def run():
     train(model)
     save_full_imputations(model)
 
+
 if __name__ == '__main__':
     run()
-
